@@ -1,20 +1,19 @@
 import streamlit as st
-import ccxt
+import requests
 import matplotlib.pyplot as plt
 import numpy as np
-import time
-from datetime import datetime
+import pandas as pd
+from datetime import datetime, timedelta
 import matplotlib.dates as mdates
 from io import BytesIO
 import base64
+import time
 
-# Inicjalizacja Binance
-@st.cache_resource
-def init_exchange():
-    return ccxt.binance({'enableRateLimit': True})
+# Konfiguracja
+st.set_page_config(page_title="Binance Order Tracker", layout="wide")
+st.title("🚀 Live Tracker Order Book - BTC/USDT")
 
-exchange = init_exchange()
-symbol = 'BTC/USDT'
+symbol = 'BTCUSDT'  # Binance format
 refresh_interval = 5  # Sekundy
 
 # Przedziały głębokości (jak wcześniej)
@@ -28,14 +27,21 @@ buckets = [
 colors = ['#1f77b4', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
 
 def fetch_data():
-    orderbook = exchange.fetch_order_book(symbol, limit=100)
-    bids = np.array(orderbook['bids'])
-    asks = np.array(orderbook['asks'])
+    base_url = 'https://api.binance.com/api/v3'
     
-    ticker = exchange.fetch_ticker(symbol)
-    current_price = ticker['last']
-    volume_24h = ticker['quoteVolume'] / 1e9
+    # Ticker (cena + wolumen 24h)
+    ticker_url = f'{base_url}/ticker/24hr?symbol={symbol}'
+    ticker = requests.get(ticker_url).json()
+    current_price = float(ticker['lastPrice'])
+    volume_24h = float(ticker['quoteVolume']) / 1e9  # W miliardach USD
     
+    # Order book (limit 100)
+    depth_url = f'{base_url}/depth?symbol={symbol}&limit=100'
+    orderbook = requests.get(depth_url).json()
+    bids = np.array(orderbook['bids'], dtype=float)  # [price, amount]
+    asks = np.array(orderbook['asks'], dtype=float)
+    
+    # Głębokość w bucketach
     bid_depths = [0] * len(buckets)
     ask_depths = [0] * len(buckets)
     
@@ -53,15 +59,25 @@ def fetch_data():
                 ask_depths[i] += usd_value
                 break
     
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='2w', limit=100)
-    times = [datetime.fromtimestamp(candle[0]/1000) for candle in ohlcv]
-    prices = [candle[4] for candle in ohlcv]
-    volumes = [candle[5] * candle[4] / 1e9 for candle in ohlcv]
+    # OHLCV (klines dla 2 tygodni, interval 1h dla więcej punktów)
+    end_time = int(time.time() * 1000)
+    start_time = end_time - (14 * 24 * 60 * 60 * 1000)  # 2 tygodnie
+    klines_url = f'{base_url}/klines?symbol={symbol}&interval=1h&startTime={start_time}&endTime={end_time}&limit=336'  # ~2w w godzinach
+    klines = requests.get(klines_url).json()
+    
+    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['close'] = df['close'].astype(float)
+    df['quote_volume'] = df['quote_asset_volume'].astype(float) / 1e9  # USD approx
     
     return {
-        'times': times, 'prices': prices, 'volumes': volumes,
-        'current_price': current_price, 'volume_24h': volume_24h,
-        'bid_depths': bid_depths, 'ask_depths': ask_depths,
+        'times': df['timestamp'].tolist(),
+        'prices': df['close'].tolist(),
+        'volumes': df['quote_volume'].tolist(),
+        'current_price': current_price,
+        'volume_24h': volume_24h,
+        'bid_depths': bid_depths,
+        'ask_depths': ask_depths,
         'buckets': [label for _, _, label in buckets]
     }
 
@@ -70,9 +86,10 @@ def plot_charts(data):
     
     # Górny: Heatmap + cena
     times_num = mdates.date2num(data['times'])
-    # Symulowana heatmapa (outer product dla efektu)
+    min_price, max_price = min(data['prices']), max(data['prices'])
+    # Symulowana heatmapa (na podstawie wolumenu)
     heatmap_data = np.outer(data['volumes'], np.ones(len(data['prices'])))
-    im = ax1.imshow(heatmap_data.T, aspect='auto', cmap='hot', extent=[times_num[0], times_num[-1], min(data['prices']), max(data['prices'])], alpha=0.7)
+    im = ax1.imshow(heatmap_data.T, aspect='auto', cmap='hot', extent=[times_num[0], times_num[-1], min_price, max_price], alpha=0.7)
     ax1.plot(times_num, data['prices'], 'b-', linewidth=2, label='Cena')
     ax1.axhline(y=data['current_price'], color='r', linestyle='--', label=f'Aktualna: ${data["current_price"]:.0f}')
     ax1.set_ylabel('Cena (USD)')
@@ -102,25 +119,22 @@ def plot_charts(data):
     fig.autofmt_xdate()
     plt.tight_layout()
     
-    # Zapisz do bufora dla Streamlit
+    # Do Streamlit (base64)
     buf = BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
 
-# Interfejs Streamlit
-st.set_page_config(page_title="Binance Order Tracker", layout="wide")
-st.title("🚀 Live Tracker Order Book - BTC/USDT")
-
-if st.button("Odśwież teraz") or st.sidebar.button("Auto-refresh (co 5s)"):
-    with st.spinner("Pobieram dane..."):
+# Interfejs
+if st.button("Odśwież teraz"):
+    with st.spinner("Pobieram dane z Binance..."):
         data = fetch_data()
     
-    # Wyświetl wykres
+    # Wykres
     img_data = plot_charts(data)
     st.image(img_data, use_column_width=True)
     
-    # Dodatkowe info
+    # Metryki
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Aktualna cena", f"${data['current_price']:.0f}")
@@ -129,6 +143,10 @@ if st.button("Odśwież teraz") or st.sidebar.button("Auto-refresh (co 5s)"):
     
     st.caption(f"Ostatnia aktualizacja: {datetime.now().strftime('%H:%M:%S UTC')}")
 
-# Auto-refresh (użyj st.rerun w nowszych wersjach, tu symulacja)
-time.sleep(refresh_interval)
-st.rerun()  # Odświeża stronę automatycznie
+# Auto-refresh (co 5s, ale tylko po pierwszym ładowaniu)
+placeholder = st.empty()
+with placeholder.container():
+    if st.button("Włącz auto-refresh (co 5s)"):
+        for _ in range(100):  # Ogranicz do 100 odświeżeń, by nie wisieć
+            time.sleep(refresh_interval)
+            st.rerun()
