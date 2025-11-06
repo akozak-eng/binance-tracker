@@ -16,7 +16,7 @@ st.title("🚀 Live Tracker Order Book - BTC/USDT")
 symbol = 'BTCUSDT'  # Binance format
 refresh_interval = 5  # Sekundy
 
-# Przedziały głębokości (jak wcześniej)
+# Przedziały głębokości
 buckets = [
     (100, 1000, '100-1k'),
     (1000, 10000, '1k-10k'),
@@ -26,71 +26,105 @@ buckets = [
 ]
 colors = ['#1f77b4', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
 
+@st.cache_data(ttl=refresh_interval)  # Cache na 5s, by nie spamować API
 def fetch_data():
     base_url = 'https://api.binance.com/api/v3'
-    
-    # Ticker (cena + wolumen 24h)
-    ticker_url = f'{base_url}/ticker/24hr?symbol={symbol}'
-    ticker = requests.get(ticker_url).json()
-    current_price = float(ticker['lastPrice'])
-    volume_24h = float(ticker['quoteVolume']) / 1e9  # W miliardach USD
-    
-    # Order book (limit 100)
-    depth_url = f'{base_url}/depth?symbol={symbol}&limit=100'
-    orderbook = requests.get(depth_url).json()
-    bids = np.array(orderbook['bids'], dtype=float)  # [price, amount]
-    asks = np.array(orderbook['asks'], dtype=float)
-    
-    # Głębokość w bucketach
-    bid_depths = [0] * len(buckets)
-    ask_depths = [0] * len(buckets)
-    
-    for price, amount in bids:
-        usd_value = amount * price
-        for i, (low, high, _) in enumerate(buckets):
-            if low <= usd_value < high:
-                bid_depths[i] += usd_value
-                break
-    
-    for price, amount in asks:
-        usd_value = amount * price
-        for i, (low, high, _) in enumerate(buckets):
-            if low <= usd_value < high:
-                ask_depths[i] += usd_value
-                break
-    
-    # OHLCV (klines dla 2 tygodni, interval 1h dla więcej punktów)
-    end_time = int(time.time() * 1000)
-    start_time = end_time - (14 * 24 * 60 * 60 * 1000)  # 2 tygodnie
-    klines_url = f'{base_url}/klines?symbol={symbol}&interval=1h&startTime={start_time}&endTime={end_time}&limit=336'  # ~2w w godzinach
-    klines = requests.get(klines_url).json()
-    
-    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df['close'] = df['close'].astype(float)
-    df['quote_volume'] = df['quote_asset_volume'].astype(float) / 1e9  # USD approx
-    
-    return {
-        'times': df['timestamp'].tolist(),
-        'prices': df['close'].tolist(),
-        'volumes': df['quote_volume'].tolist(),
-        'current_price': current_price,
-        'volume_24h': volume_24h,
-        'bid_depths': bid_depths,
-        'ask_depths': ask_depths,
-        'buckets': [label for _, _, label in buckets]
+    data = {
+        'current_price': 0.0,
+        'volume_24h': 0.0,
+        'bid_depths': [0] * len(buckets),
+        'ask_depths': [0] * len(buckets),
+        'buckets': [label for _, _, label in buckets],
+        'times': [],
+        'prices': [],
+        'volumes': [],
+        'error': None
     }
+    
+    # Ticker
+    try:
+        ticker_url = f'{base_url}/ticker/24hr?symbol={symbol}'
+        response = requests.get(ticker_url, timeout=10)
+        if response.status_code == 200:
+            ticker = response.json()
+            if 'lastPrice' in ticker:
+                data['current_price'] = float(ticker['lastPrice'])
+                data['volume_24h'] = float(ticker.get('quoteVolume', 0)) / 1e9
+            else:
+                data['error'] = f"Brak 'lastPrice' w odpowiedzi: {ticker.get('msg', 'Nieznany błąd')}"
+        else:
+            data['error'] = f"Błąd API (kod {response.status_code}): {response.text[:200]}"
+    except Exception as e:
+        data['error'] = f"Błąd pobierania tickera: {str(e)}"
+    
+    # Order book
+    if not data['error']:
+        try:
+            depth_url = f'{base_url}/depth?symbol={symbol}&limit=100'
+            response = requests.get(depth_url, timeout=10)
+            if response.status_code == 200:
+                orderbook = response.json()
+                bids = np.array(orderbook.get('bids', []), dtype=float)
+                asks = np.array(orderbook.get('asks', []), dtype=float)
+                
+                for price, amount in bids:
+                    usd_value = amount * price
+                    for i, (low, high, _) in enumerate(buckets):
+                        if low <= usd_value < high:
+                            data['bid_depths'][i] += usd_value
+                            break
+                
+                for price, amount in asks:
+                    usd_value = amount * price
+                    for i, (low, high, _) in enumerate(buckets):
+                        if low <= usd_value < high:
+                            data['ask_depths'][i] += usd_value
+                            break
+            else:
+                data['error'] = f"Błąd order book (kod {response.status_code})"
+        except Exception as e:
+            data['error'] = f"Błąd order book: {str(e)}"
+    
+    # OHLCV (historia)
+    if not data['error']:
+        try:
+            end_time = int(time.time() * 1000)
+            start_time = end_time - (14 * 24 * 60 * 60 * 1000)  # 2 tygodnie
+            klines_url = f'{base_url}/klines?symbol={symbol}&interval=1h&startTime={start_time}&endTime={end_time}&limit=336'
+            response = requests.get(klines_url, timeout=10)
+            if response.status_code == 200:
+                klines = response.json()
+                if klines:
+                    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df['close'] = df['close'].astype(float)
+                    df['quote_volume'] = df['quote_asset_volume'].astype(float) / 1e9
+                    
+                    data['times'] = df['timestamp'].tolist()
+                    data['prices'] = df['close'].tolist()
+                    data['volumes'] = df['quote_volume'].tolist()
+                else:
+                    data['error'] = "Pusta historia cen"
+            else:
+                data['error'] = f"Błąd historii (kod {response.status_code})"
+        except Exception as e:
+            data['error'] = f"Błąd historii: {str(e)}"
+    
+    return data
 
 def plot_charts(data):
+    if data['error']:
+        st.error(data['error'])
+        return None
+    
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
     
     # Górny: Heatmap + cena
     times_num = mdates.date2num(data['times'])
     min_price, max_price = min(data['prices']), max(data['prices'])
-    # Symulowana heatmapa (na podstawie wolumenu)
     heatmap_data = np.outer(data['volumes'], np.ones(len(data['prices'])))
     im = ax1.imshow(heatmap_data.T, aspect='auto', cmap='hot', extent=[times_num[0], times_num[-1], min_price, max_price], alpha=0.7)
-    ax1.plot(times_num, data['prices'], 'b-', linewidth=2, label='Cena')
+    ax1.plot(times_num, data['prices'], 'b-', linewidth=2, label='Cena historyczna')
     ax1.axhline(y=data['current_price'], color='r', linestyle='--', label=f'Aktualna: ${data["current_price"]:.0f}')
     ax1.set_ylabel('Cena (USD)')
     ax1.set_title(f'{symbol} - Live Order Book | Wolumen 24h: ${data["volume_24h"]:.2f}B')
@@ -119,7 +153,6 @@ def plot_charts(data):
     fig.autofmt_xdate()
     plt.tight_layout()
     
-    # Do Streamlit (base64)
     buf = BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
@@ -130,23 +163,27 @@ if st.button("Odśwież teraz"):
     with st.spinner("Pobieram dane z Binance..."):
         data = fetch_data()
     
-    # Wykres
-    img_data = plot_charts(data)
-    st.image(img_data, use_column_width=True)
-    
-    # Metryki
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Aktualna cena", f"${data['current_price']:.0f}")
-    with col2:
-        st.metric("Wolumen 24h", f"${data['volume_24h']:.2f}B")
-    
-    st.caption(f"Ostatnia aktualizacja: {datetime.now().strftime('%H:%M:%S UTC')}")
+    if data['error']:
+        st.error(data['error'])
+    else:
+        # Wykres
+        img_data = plot_charts(data)
+        if img_data:
+            st.image(img_data, use_column_width=True)
+        
+        # Metryki
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Aktualna cena", f"${data['current_price']:.0f}")
+        with col2:
+            st.metric("Wolumen 24h", f"${data['volume_24h']:.2f}B")
+        
+        st.caption(f"Ostatnia aktualizacja: {datetime.now().strftime('%H:%M:%S UTC')}")
 
-# Auto-refresh (co 5s, ale tylko po pierwszym ładowaniu)
-placeholder = st.empty()
-with placeholder.container():
-    if st.button("Włącz auto-refresh (co 5s)"):
-        for _ in range(100):  # Ogranicz do 100 odświeżeń, by nie wisieć
-            time.sleep(refresh_interval)
-            st.rerun()
+# Auto-refresh (opcjonalny przycisk)
+if st.button("Włącz auto-refresh (co 5s)"):
+    st.info("Auto-refresh włączony – odświeżam co 5s (zatrzymaj reload strony).")
+    for _ in range(20):  # Max 20 cykli (~2 min), by nie wisieć
+        time.sleep(refresh_interval)
+        st.rerun()
+    st.warning("Auto-refresh zatrzymany po 2 min – kliknij ponownie, by wznowić.")
